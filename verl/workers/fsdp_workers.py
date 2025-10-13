@@ -1800,9 +1800,9 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             prompt_with_chat_template = target_tokenizer.apply_chat_template(
                 chat, add_generation_prompt=False, tokenize=False
             )
-            if self.rank == 0 and i == 0:
-                # for debugging purpose
-                print(f"Switch template. chat: {prompt_with_chat_template}")
+            # if self.rank == 0 and i == 0:
+            #     # for debugging purpose
+            #     print(f"Switch template. chat: {prompt_with_chat_template}")
 
             # the maximum length is actually determined by the reward model itself
             max_length = self.config.get("max_length", src_max_length)
