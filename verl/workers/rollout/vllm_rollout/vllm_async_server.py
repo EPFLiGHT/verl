@@ -32,6 +32,7 @@ from vllm.entrypoints.openai.api_server import (
     init_app_state,
 )
 from vllm.inputs import TokensPrompt
+from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import FlexibleArgumentParser, get_tcp_uri
@@ -46,6 +47,12 @@ from verl.workers.config import HFModelConfig, RewardModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import get_free_port, run_unvicorn
 from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
+from verl.workers.rollout.vllm_rollout.utils import (
+    VLLM_LORA_INT_ID,
+    VLLM_LORA_NAME,
+    VLLM_LORA_PATH,
+    get_vllm_max_lora_rank,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
@@ -100,14 +107,17 @@ class ExternalZeroMQDistributedExecutor(Executor):
         outputs = []
         for socket in self.sockets:
             outputs.append(pickle.loads(socket.recv()))
+
+        for output in outputs:
+            if isinstance(output, Exception):
+                raise output
         return outputs
 
     def check_health(self):
         return
 
 
-@ray.remote(num_cpus=1)
-class vLLMHttpServer:
+class vLLMHttpServerBase:
     """vLLM http server in single node, this is equivalent to launch server with command line:
     ```
     vllm serve --tensor-parallel-size=8 ...
@@ -244,6 +254,16 @@ class vLLMHttpServer:
                 }
             )
 
+        # update lora-related args
+        if self.model_config.lora_rank > 0:
+            args.update(
+                {
+                    "enable_lora": True,
+                    "max_loras": 1,
+                    "max_lora_rank": get_vllm_max_lora_rank(self.model_config.lora_rank),
+                }
+            )
+
         server_args = ["serve", self.model_config.local_path]
         for k, v in args.items():
             if isinstance(v, bool):
@@ -354,7 +374,15 @@ class vLLMHttpServer:
         prompt = TokensPrompt(
             prompt_token_ids=prompt_ids, multi_modal_data={"image": image_data} if image_data else None
         )
-        generator = self.engine.generate(prompt=prompt, sampling_params=sampling_params, request_id=request_id)
+
+        # Add lora request
+        lora_request = None
+        if self.model_config.lora_rank > 0:
+            lora_request = LoRARequest(lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH)
+
+        generator = self.engine.generate(
+            prompt=prompt, sampling_params=sampling_params, request_id=request_id, lora_request=lora_request
+        )
 
         # Get final response
         final_res: Optional[RequestOutput] = None
@@ -395,10 +423,42 @@ class vLLMHttpServer:
         await self.engine.wait_for_requests_to_drain()
 
 
+@ray.remote(num_cpus=1)
+class vLLMHttpServer(vLLMHttpServerBase):
+    """vLLM http server in single node, this is equivalent to launch server with command line:
+    ```
+    vllm serve --tensor-parallel-size=8 ...
+    ```
+    """
+
+    def __init__(
+        self,
+        config: RolloutConfig | RewardModelConfig,
+        model_config: HFModelConfig,
+        rollout_mode: RolloutMode,
+        workers: list[ActorHandle],
+        replica_rank: int,
+        node_rank: int,
+        gpus_per_node: int,
+        nnodes: int,
+    ):
+        super().__init__(config, model_config, rollout_mode, workers, replica_rank, node_rank, gpus_per_node, nnodes)
+
+
 _rollout_worker_actor_cls = ray.remote(vLLMAsyncRollout)
 
 
 class vLLMReplica(RolloutReplica):
+    def __init__(
+        self,
+        replica_rank: int,
+        config: RolloutConfig | RewardModelConfig,
+        model_config: HFModelConfig,
+        gpus_per_node: int = 8,
+    ):
+        super().__init__(replica_rank, config, model_config, gpus_per_node)
+        self.server_class = vLLMHttpServer
+
     def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
         """Get rollout worker actor class for colocated and standalone mode."""
         worker_dict_cls = RayClassWithInitArgs(
@@ -433,7 +493,7 @@ class vLLMReplica(RolloutReplica):
         for node_rank in range(nnodes):
             workers = self.workers[node_rank * gpus_per_node : (node_rank + 1) * gpus_per_node]
             node_id = worker_node_ids[node_rank * gpus_per_node]
-            server = vLLMHttpServer.options(
+            server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node_id,
                     soft=False,
