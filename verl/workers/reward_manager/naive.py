@@ -14,6 +14,8 @@
 
 from collections import defaultdict
 from typing import Any
+import asyncio
+import inspect
 
 import torch
 
@@ -43,7 +45,24 @@ class NaiveRewardManager(AbstractRewardManager):
         self.compute_score = compute_score or default_compute_score
         self.reward_fn_key = reward_fn_key  # Store the key for accessing the data source
 
-    def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
+    async def _compute_score(self, data_source, solution_str, ground_truth, extra_info):
+        """Asynchronous version of compute_score."""
+        if inspect.iscoroutinefunction(self.compute_score):
+            return await self.compute_score(
+                data_source=data_source,
+                solution_str=solution_str,
+                ground_truth=ground_truth,
+                extra_info=extra_info,
+            )
+        else:
+            return self.compute_score(
+                data_source=data_source,
+                solution_str=solution_str,
+                ground_truth=ground_truth,
+                extra_info=extra_info,
+            )
+
+    async def _compute(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
         """We will expand this function gradually based on the available datasets"""
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
@@ -57,6 +76,7 @@ class NaiveRewardManager(AbstractRewardManager):
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
+        future_scores = []
 
         already_print_data_sources = {}
 
@@ -86,12 +106,16 @@ class NaiveRewardManager(AbstractRewardManager):
             extra_info["num_turns"] = num_turns
             extra_info["rollout_reward_scores"] = rollout_reward_scores
 
-            score = self.compute_score(
+            future_score = self._compute_score(
                 data_source=data_source,
                 solution_str=response_str,
                 ground_truth=ground_truth,
                 extra_info=extra_info,
             )
+            future_scores.append(future_score)
+        
+        for i in range(len(data)):
+            score = await future_scores[i]
 
             if isinstance(score, dict):
                 reward = score["score"]
@@ -124,3 +148,7 @@ class NaiveRewardManager(AbstractRewardManager):
             }
         else:
             return reward_tensor
+
+    def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
+        """Compute reward for a batch of data."""
+        return asyncio.run(self._compute(data, return_dict))
